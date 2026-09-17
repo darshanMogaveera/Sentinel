@@ -41,8 +41,6 @@
 
 <!-- Add your Live Monitor screenshot here -->
 
-`12,264 packets` • `2,193 flows` • `2,193 predictions` • `1 threat alert` • `0 inference errors`
-
 ---
 
 # 🎯 What is Sentinel?
