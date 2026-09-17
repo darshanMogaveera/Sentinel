@@ -924,10 +924,30 @@ const LiveMonitor = () => {
                   className="text-[#7BBDE8]"
                 />
 
-                {!isRunning &&
-                  simState === 'COMPLETED'
-                  ? 'LAST COMPLETED SIMULATION'
-                  : 'CURRENT SIMULATION'}
+                {(() => {
+                  if (!isRunning && simState === 'COMPLETED') {
+                    return 'LAST COMPLETED SIMULATION';
+                  }
+                  
+                  // Check if this is a simulation run (run_id starts with SIM-)
+                  const isSimulationRun = status?.run_id?.startsWith('SIM-');
+                  
+                  if (isSimulationRun) {
+                    return 'CURRENT SIMULATION';
+                  }
+                  
+                  // Real capture - get the interface label
+                  const currentInterface = status?.interface;
+                  if (currentInterface) {
+                    const interfaceObj = interfaces.find(
+                      (iface) => iface.name === currentInterface
+                    );
+                    const interfaceLabel = interfaceObj?.label || currentInterface;
+                    return `CURRENT CAPTURE — ${interfaceLabel}`;
+                  }
+                  
+                  return 'CURRENT CAPTURE';
+                })()}
 
               </h3>
 
