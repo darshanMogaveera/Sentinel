@@ -4,24 +4,30 @@ from datetime import datetime, timedelta
 class DatabaseService:
     
     def save_prediction(self, prediction_data: dict) -> str:
-        """Save prediction to database, return prediction_id"""
-        new_prediction = Prediction(
-            source_ip=prediction_data.get('source_ip', ''),
-            dest_ip=prediction_data.get('dest_ip', ''),
-            threat=prediction_data.get('threat', False),
-            confidence=prediction_data.get('confidence', 0.0),
-            threat_type=prediction_data.get('threat_type', 'normal'),
-            explanation=prediction_data.get('explanation', ''),
-            rf_prediction=prediction_data.get('rf_prediction', 0),
-            if_prediction=prediction_data.get('if_prediction', 1),
-            run_id=prediction_data.get('run_id')
-        )
-        db.session.add(new_prediction)
-        db.session.commit()
-        return new_prediction.id
+        """Save prediction to database, return prediction_id or None on failure"""
+        try:
+            new_prediction = Prediction(
+                source_ip=prediction_data.get('source_ip', ''),
+                dest_ip=prediction_data.get('dest_ip', ''),
+                threat=prediction_data.get('threat', False),
+                confidence=prediction_data.get('confidence', 0.0),
+                threat_type=prediction_data.get('threat_type', 'normal'),
+                explanation=prediction_data.get('explanation', ''),
+                rf_prediction=prediction_data.get('rf_prediction', 0),
+                if_prediction=prediction_data.get('if_prediction', 1),
+                run_id=prediction_data.get('run_id')
+            )
+            db.session.add(new_prediction)
+            db.session.commit()
+            return new_prediction.id
+        except Exception as e:
+            db.session.rollback()
+            from backend.services.logging_service import logger_service
+            logger_service.log_error(e, {"context": "DatabaseService.save_prediction"})
+            return None
     
     def save_alert(self, prediction_id: str, severity: str = 'medium') -> str:
-        """Save alert to database, return alert_id"""
+        """Save alert to database, return alert_id or None on failure"""
         try:
             new_alert = Alert(
                 prediction_id=prediction_id,
@@ -35,6 +41,8 @@ class DatabaseService:
         except Exception as e:
             print(f"DEBUG ERROR saving alert: {e}")
             db.session.rollback()
+            from backend.services.logging_service import logger_service
+            logger_service.log_error(e, {"context": "DatabaseService.save_alert", "prediction_id": prediction_id})
             return None
     
     def get_prediction_history(self, limit: int = 100):

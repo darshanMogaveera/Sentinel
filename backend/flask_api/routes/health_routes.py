@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify
 from datetime import datetime
+from backend.services.live_inference_service import live_inference_service
 from backend.services.threat_detection_service import threat_service
 from backend.database.db_models import db
 
@@ -10,7 +11,11 @@ def health_status():
     """
     GET /api/health/status
     """
-    models_loaded = (threat_service.rf_model is not None) or (threat_service.if_model is not None)
+    models_loaded = bool(
+        live_inference_service.models_loaded or
+        (threat_service.rf_model is not None) or
+        (threat_service.if_model is not None)
+    )
     
     db_connected = False
     try:

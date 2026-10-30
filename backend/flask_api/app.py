@@ -49,4 +49,7 @@ def create_app(config_name: str = 'development') -> Flask:
     app.register_blueprint(live_bp)
     app.register_blueprint(device_bp)
     
+    from backend.database.db_init import init_db
+    init_db(app)
+
     return app

@@ -46,26 +46,66 @@ class LiveFlowExtractor:
         self.sim_target_port = None
         self.flows = {} # Dummy dict for API compatibility if needed
 
-    def set_simulation_target(self, dest_ip: str, dest_port: int):
+    def set_simulation_target(self, dest_ip: str, dest_port: int = None, dest_ports: list = None):
         self.sim_target_ip = dest_ip
-        self.sim_target_port = int(dest_port)
+        if dest_ports:
+            self.sim_target_ports = set(int(p) for p in dest_ports)
+            self.sim_target_port = list(dest_ports)[0]
+        elif dest_port is not None:
+            self.sim_target_port = int(dest_port)
+            self.sim_target_ports = {int(dest_port)}
+        else:
+            self.sim_target_port = None
+            self.sim_target_ports = None
 
     def extract_features_from_nfstream(self, flow):
+        src_port = safe(getattr(flow, "src_port", None))
+        dst_port = safe(getattr(flow, "dst_port", None))
+
         # Apply Sentinel filter
-        if flow.src_port in SENTINEL_PORTS or flow.dst_port in SENTINEL_PORTS:
+        if src_port in SENTINEL_PORTS or dst_port in SENTINEL_PORTS:
             return None
 
         # Apply simulation filter
-        if self.sim_target_port is not None:
+        target_ports = getattr(self, "sim_target_ports", None)
+        if target_ports is not None:
             involves_target_port = (
-                flow.src_port == self.sim_target_port or
-                flow.dst_port == self.sim_target_port
+                src_port in target_ports or
+                dst_port in target_ports
             )
-            involves_target_ip = (
-                self.sim_target_ip is None or
-                flow.src_ip == self.sim_target_ip or
-                flow.dst_ip == self.sim_target_ip
+            src_ip = str(getattr(flow, "src_ip", "") or "")
+            dst_ip = str(getattr(flow, "dst_ip", "") or "")
+
+            loopback_hosts = {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::ffff:127.0.0.1"}
+            if self.sim_target_ip in loopback_hosts:
+                involves_target_ip = (src_ip in loopback_hosts or dst_ip in loopback_hosts)
+            else:
+                involves_target_ip = (
+                    self.sim_target_ip is None or
+                    src_ip == self.sim_target_ip or
+                    dst_ip == self.sim_target_ip
+                )
+
+            if not (involves_target_port and involves_target_ip):
+                return None
+        elif self.sim_target_port is not None:
+            involves_target_port = (
+                src_port == self.sim_target_port or
+                dst_port == self.sim_target_port
             )
+            src_ip = str(getattr(flow, "src_ip", "") or "")
+            dst_ip = str(getattr(flow, "dst_ip", "") or "")
+
+            loopback_hosts = {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::ffff:127.0.0.1"}
+            if self.sim_target_ip in loopback_hosts:
+                involves_target_ip = (src_ip in loopback_hosts or dst_ip in loopback_hosts)
+            else:
+                involves_target_ip = (
+                    self.sim_target_ip is None or
+                    src_ip == self.sim_target_ip or
+                    dst_ip == self.sim_target_ip
+                )
+
             if not (involves_target_port and involves_target_ip):
                 return None
 

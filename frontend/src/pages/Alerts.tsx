@@ -13,31 +13,13 @@ import {
   Clock
 } from 'lucide-react';
 
-const FEATURE_MAPPING: Record<string, { name: string, description: string }> = {
-  "spkts": { name: "Packets sent", description: "The number of packets sent from the source to the destination." },
-  "dpkts": { name: "Packets received", description: "The number of packets sent from the destination back to the source." },
-  "sbytes": { name: "Data sent", description: "The total amount of data sent from the source." },
-  "dbytes": { name: "Data received", description: "The total amount of data received from the destination." },
-  "dur": { name: "Connection duration", description: "The total time the network connection was active." },
-  "sttl": { name: "Sender packet lifetime (TTL)", description: "The Time-To-Live value of packets from the sender, indicating routing hops." },
-  "dttl": { name: "Receiver packet lifetime (TTL)", description: "The Time-To-Live value of packets from the receiver, indicating routing hops." },
-  "smean": { name: "Average outgoing packet size", description: "The average amount of data carried by each outgoing packet." },
-  "dmean": { name: "Average incoming packet size", description: "The average amount of data carried by each incoming packet." },
-  "rate": { name: "Packet rate", description: "The total number of packets transferred per second." },
-  "sload": { name: "Outgoing data rate", description: "The speed at which data was sent from the source." },
-  "dload": { name: "Incoming data rate", description: "The speed at which data was received from the destination." },
-  "proto_tcp": { name: "TCP protocol", description: "The communication used the Transmission Control Protocol (TCP)." },
-  "proto_udp": { name: "UDP protocol", description: "The communication used the User Datagram Protocol (UDP)." },
-  "proto_icmp": { name: "ICMP protocol", description: "The communication used the Internet Control Message Protocol (ICMP)." },
-  "proto_other": { name: "Other protocol", description: "The communication used an uncommon network protocol." },
-};
+import {
+  FEATURE_MAPPING,
+  PROTOCOL_FEATURES,
+  getFeatureDisplayName,
+  getModelExplanationSummary
+} from '../utils/explanationSummary';
 
-const PROTOCOL_FEATURES = new Set([
-  "proto_tcp",
-  "proto_udp",
-  "proto_icmp",
-  "proto_other"
-]);
 
 /**
  * Backend timestamps are currently stored as UTC without a timezone
@@ -144,14 +126,17 @@ const Alerts = () => {
   const [isSystemActive, setIsSystemActive] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   const fetchAlerts = async (currentLimit: number) => {
     try {
       const res = await getAlerts(currentLimit);
       setAlerts(res.data.alerts || []);
       setStats(res.data.stats || null);
-    } catch (err) {
+      setFetchError(null);
+    } catch (err: any) {
       console.error("Failed to load alerts", err);
+      setFetchError(err?.message || "Failed to load alerts from backend");
     } finally {
       setLoading(false);
     }
@@ -169,6 +154,12 @@ const Alerts = () => {
       .catch(() => {
         setIsSystemActive(false);
       });
+
+    const interval = setInterval(() => {
+      fetchAlerts(limit);
+    }, 3000);
+
+    return () => clearInterval(interval);
   }, [limit]);
 
   const filteredAlerts = alerts.filter(alert => {
@@ -225,6 +216,13 @@ const Alerts = () => {
           </p>
         </div>
       </div>
+
+      {fetchError && (
+        <div className="bg-rose-500/10 border border-rose-500/30 rounded-xl p-4 flex items-center gap-3 text-rose-300 text-sm">
+          <AlertTriangle size={18} className="text-rose-400 flex-shrink-0" />
+          <span>Failed to load alerts: {fetchError}</span>
+        </div>
+      )}
 
       {/* SUMMARY CARDS */}
       {stats && (
@@ -736,53 +734,17 @@ const Alerts = () => {
                                       ) : (
                                         explanationObj.top_features.map(
                                           (feat: any, i: number) => {
-
-                                            let mapping;
-
-                                            if (
-                                              PROTOCOL_FEATURES.has(
-                                                feat.feature
-                                              ) &&
-                                              feat.raw_value === 0
-                                            ) {
-
-                                              mapping = {
-                                                name:
-                                                  `${feat.feature
-                                                    .replace(
-                                                      'proto_',
-                                                      ''
-                                                    )
-                                                    .toUpperCase()} indicator (absent)`,
-
-                                                description: ""
-                                              };
-
-                                            } else {
-
-                                              mapping =
-                                                FEATURE_MAPPING[
-                                                feat.feature
-                                                ] || {
-                                                  name:
-                                                    feat.feature,
-
-                                                  description: ""
-                                                };
-
-                                            }
-
+                                            const displayName = getFeatureDisplayName(feat);
                                             const isPositive =
-                                              feat.impact > 0;
+                                              typeof feat?.impact === 'number' && feat.impact > 0;
 
                                             return (
                                               <div
                                                 key={`exp-${i}`}
                                                 className="flex justify-between items-center p-3 bg-[#0A4174]/20 rounded border border-[#49769F]/20"
                                               >
-
                                                 <div className="text-sm text-white font-medium">
-                                                  {mapping.name}
+                                                  {displayName}
                                                 </div>
 
                                                 <div
@@ -795,7 +757,6 @@ const Alerts = () => {
                                                     ? 'Toward threat'
                                                     : 'Away from threat'}
                                                 </div>
-
                                               </div>
                                             );
                                           }
@@ -803,9 +764,32 @@ const Alerts = () => {
                                       )}
                                     </div>
 
-                                    <p className="text-[10px] text-[#6EA2B3] mt-3 italic leading-relaxed">
-                                      These features had the strongest influence on Sentinel's classification. Positive contribution indicates the model associated this traffic with the threat class.
-                                    </p>
+                                    {(() => {
+                                      const summary = getModelExplanationSummary(explanationObj.top_features);
+                                      return (
+                                        <p className="text-[10px] text-[#6EA2B3] mt-3 italic leading-relaxed">
+                                          {summary.parts ? (
+                                            <>
+                                              {summary.parts.prefix}
+                                              <strong className="font-bold text-white not-italic">
+                                                {summary.parts.strongest}
+                                              </strong>
+                                              {summary.parts.middle}
+                                              {summary.parts.weakest ? (
+                                                <>
+                                                  <strong className="font-bold text-white not-italic">
+                                                    {summary.parts.weakest}
+                                                  </strong>
+                                                  {summary.parts.suffix}
+                                                </>
+                                              ) : null}
+                                            </>
+                                          ) : (
+                                            summary.text
+                                          )}
+                                        </p>
+                                      );
+                                    })()}
 
                                   </div>
 
@@ -855,7 +839,7 @@ const Alerts = () => {
                                               </th>
 
                                               <th className="py-2 pr-4 font-normal">
-                                                Scaled Input
+                                                Raw Value
                                               </th>
 
                                               <th className="py-2 font-normal text-right">
@@ -871,8 +855,14 @@ const Alerts = () => {
                                             {explanationObj.top_features.map(
                                               (feat: any, i: number) => {
 
+                                                const hasImpact =
+                                                  typeof feat?.impact === 'number';
+
                                                 const isPositive =
-                                                  feat.impact > 0;
+                                                  hasImpact && feat.impact > 0;
+
+                                                const hasRaw =
+                                                  typeof feat?.raw_value === 'number';
 
                                                 return (
                                                   <tr
@@ -881,13 +871,13 @@ const Alerts = () => {
                                                   >
 
                                                     <td className="py-2 pr-4 text-white">
-                                                      {feat.feature}
+                                                      {feat?.feature || 'Unknown feature'}
                                                     </td>
 
                                                     <td className="py-2 pr-4">
-                                                      {feat.scaled_value !== undefined
+                                                      {hasRaw
                                                         ? Number(
-                                                          feat.scaled_value
+                                                          feat.raw_value
                                                         ).toFixed(4)
                                                         : 'N/A'}
                                                     </td>
@@ -895,13 +885,14 @@ const Alerts = () => {
                                                     <td
                                                       className={`py-2 text-right ${isPositive
                                                           ? 'text-rose-400'
-                                                          : 'text-emerald-400'
+                                                          : hasImpact
+                                                            ? 'text-emerald-400'
+                                                            : 'text-[#6EA2B3]'
                                                         }`}
                                                     >
-                                                      {isPositive
-                                                        ? '+'
-                                                        : ''}
-                                                      {feat.impact.toFixed(4)}
+                                                      {hasImpact
+                                                        ? `${isPositive ? '+' : ''}${feat.impact.toFixed(4)}`
+                                                        : 'N/A'}
                                                     </td>
 
                                                   </tr>

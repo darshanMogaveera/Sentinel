@@ -14,7 +14,8 @@ import {
   getLiveDevices,
   startLiveCapture,
   stopLiveCapture,
-  runLiveSimulation
+  runLiveSimulation,
+  getLiveRunStats
 } from '../api/client';
 
 type NetworkInterface = {
@@ -33,6 +34,13 @@ const LiveMonitor = () => {
   const [interfacesLoading, setInterfacesLoading] = useState(true);
 
   const [actionLoading, setActionLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  type SimMode = 'single' | 'range';
+  const [simMode, setSimMode] = useState<SimMode>('single');
+  const [rangeStart, setRangeStart] = useState<number>(12340);
+  const [rangeEnd, setRangeEnd] = useState<number>(12349);
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   const [simConfig, setSimConfig] = useState({
     protocol: 'UDP',
@@ -49,6 +57,8 @@ const LiveMonitor = () => {
 
   const [devices, setDevices] = useState<any[]>([]);
   const [deviceLabels, setDeviceLabels] = useState<Record<string, string>>({});
+  const [simRunId, setSimRunId] = useState<string | null>(null);
+  const [simStats, setSimStats] = useState<any | null>(null);
 
   // ---------------------------------------------------------
   // Fetch available network interfaces
@@ -72,29 +82,24 @@ const LiveMonitor = () => {
       setInterfaces(availableInterfaces);
 
       if (availableInterfaces.length > 0) {
-        const preferredInterface = availableInterfaces.find(
-          (iface) =>
-            /wi[- ]?fi|wireless|wlan/i.test(
-              `${iface.label} ${iface.description || ''}`
-            ) &&
-            !/loopback/i.test(
-              `${iface.label} ${iface.description || ''}`
-            )
-        );
+        const savedInterface = localStorage.getItem('sentinel_selected_interface');
+        const matchSaved = savedInterface && availableInterfaces.find((i) => i.name === savedInterface);
 
-        const nonLoopbackInterface = availableInterfaces.find(
-          (iface) =>
-            !/loopback/i.test(
-              `${iface.label} ${iface.description || ''}`
-            )
-        );
-
-        const selected =
-          preferredInterface ||
-          nonLoopbackInterface ||
-          availableInterfaces[0];
-
-        setInterfaceName(selected.name);
+        setInterfaceName((prev) => {
+          if (prev && availableInterfaces.some((i) => i.name === prev)) {
+            return prev;
+          }
+          if (matchSaved) {
+            return matchSaved.name;
+          }
+          const loopback = availableInterfaces.find((i) =>
+            /loopback/i.test(`${i.label} ${i.name}`)
+          );
+          const preferredInterface = availableInterfaces.find((iface) =>
+            /wi[- ]?fi|wireless|wlan/i.test(`${iface.label} ${iface.description || ''}`)
+          );
+          return (loopback || preferredInterface || availableInterfaces[0]).name;
+        });
       } else {
         setError('No network interfaces were detected.');
       }
@@ -117,7 +122,19 @@ const LiveMonitor = () => {
       const res = await getLiveStatus();
 
       setStatus(res.data);
-      setError(null);
+      // Only update interface name from backend if capture is running AND the
+      // user has no selection yet. Do NOT overwrite a user-chosen interface
+      // because that causes the dropdown to silently revert on every status poll.
+      if (res.data?.running && res.data?.interface && !interfaceName) {
+        setInterfaceName(res.data.interface);
+      }
+      if (res.data?.stats?.last_error) {
+        setError(`Capture error: ${res.data.stats.last_error}`);
+      } else if (res.data?.error) {
+        setError(res.data.error);
+      } else {
+        setError(null);
+      }
 
       const devRes = await getLiveDevices();
       setDevices(devRes.data.devices || []);
@@ -197,56 +214,190 @@ const LiveMonitor = () => {
   // Run traffic simulation
   // ---------------------------------------------------------
   const handleSimulate = async () => {
-    if (!status?.running) return;
+    if (isSubmitting || isSimActive || !status?.running) return;
 
+    setValidationError(null);
     setApiError(null);
 
-    try {
-      await runLiveSimulation(
-        simConfig
-      );
+    // 1. Destination IP validation: must be localhost/loopback address
+    const ip = (simConfig.dest_ip || '').trim();
+    if (!ip) {
+      setValidationError('Destination IP is required.');
+      return;
+    }
+    const isLoopback =
+      ip === '127.0.0.1' ||
+      ip.toLowerCase() === 'localhost' ||
+      ip === '::1' ||
+      ip.startsWith('127.');
+    if (!isLoopback) {
+      setValidationError("Destination must be a valid localhost/loopback address (127.0.0.1).");
+      return;
+    }
 
+    // Backend strictly accepts '127.0.0.1'
+    const targetDestIp = (ip.toLowerCase() === 'localhost' || ip.startsWith('127.')) ? '127.0.0.1' : ip;
+
+    // 2. Protocol validation
+    const proto = (simConfig.protocol || '').toUpperCase();
+    if (proto !== 'TCP' && proto !== 'UDP') {
+      setValidationError("Protocol must be either 'TCP' or 'UDP'.");
+      return;
+    }
+
+    // 3. Port / Range validation
+    const requestPayload: any = {
+      dest_ip: targetDestIp,
+      protocol: proto,
+      num_connections: Number(simConfig.num_connections) || 1,
+      packets_per_connection: Number(simConfig.packets_per_connection) || 1,
+      payload_size: Number(simConfig.payload_size) || 0,
+      delay_between_packets: Number(simConfig.delay_between_packets) || 0.0,
+      delay_between_connections: Number(simConfig.delay_between_connections) || 0.0
+    };
+
+    if (simMode === 'single') {
+      const p = Number(simConfig.dest_port);
+      if (isNaN(p) || !Number.isInteger(p) || p < 1 || p > 65535) {
+        setValidationError('Destination port must be an integer between 1 and 65535.');
+        return;
+      }
+      requestPayload.dest_port = p;
+    } else {
+      const s = Number(rangeStart);
+      const e = Number(rangeEnd);
+      if (isNaN(s) || !Number.isInteger(s) || s < 1 || s > 65535) {
+        setValidationError('Start port must be an integer between 1 and 65535.');
+        return;
+      }
+      if (isNaN(e) || !Number.isInteger(e) || e < 1 || e > 65535) {
+        setValidationError('End port must be an integer between 1 and 65535.');
+        return;
+      }
+      if (s > e) {
+        setValidationError(`End port (${e}) must be greater than or equal to start port (${s}).`);
+        return;
+      }
+      const count = e - s + 1;
+      if (count > 11) {
+        setValidationError(`Port range (${count} ports) exceeds the backend maximum of 11 ports.`);
+        return;
+      }
+      if (count < 1) {
+        setValidationError('At least one destination port must be specified.');
+        return;
+      }
+
+      requestPayload.port_range_start = s;
+      requestPayload.port_range_end = e;
+    }
+
+    setIsSubmitting(true);
+    setSimStats(null);
+    setSimRunId(null);
+
+    try {
+      const res = await runLiveSimulation(requestPayload);
+      const runId: string | undefined = res.data?.run_id;
+      if (runId) {
+        setSimRunId(runId);
+      }
       await fetchStatus();
     } catch (err: any) {
       setApiError(
         err.response?.data?.error ||
+        err.message ||
         'Simulation failed to start'
       );
+    } finally {
+      setIsSubmitting(false);
     }
   };
+
+  // Poll the specific simulation run's stats
+  useEffect(() => {
+    if (!simRunId) return;
+    let active = true;
+    const pollRunStats = async () => {
+      try {
+        const res = await getLiveRunStats(simRunId);
+        const data = res.data;
+        if (active && data?.stats) {
+          setSimStats(data.stats);
+          // Stop polling when simulation is done
+          if (data.stats?.simulation_state === 'COMPLETED') {
+            active = false;
+          }
+        }
+      } catch {
+        // ignore poll errors
+      }
+    };
+    pollRunStats();
+    const iv = setInterval(pollRunStats, 1000);
+    return () => { active = false; clearInterval(iv); };
+  }, [simRunId]);
 
   // ---------------------------------------------------------
   // Simulator presets
   // ---------------------------------------------------------
   const applyPreset = (preset: string) => {
+    setValidationError(null);
+    setApiError(null);
+
     if (preset === 'normal') {
-      setSimConfig({
-        ...simConfig,
+      setSimMode('single');
+      setSimConfig((prev) => ({
+        ...prev,
         protocol: 'UDP',
+        dest_ip: '127.0.0.1',
+        dest_port: 12345,
         num_connections: 3,
         packets_per_connection: 5,
         payload_size: 64,
-        delay_between_packets: 0.1
-      });
+        delay_between_packets: 0.1,
+        delay_between_connections: 0.5
+      }));
     } else if (preset === 'high_rate') {
-      setSimConfig({
-        ...simConfig,
+      setSimMode('single');
+      setSimConfig((prev) => ({
+        ...prev,
         protocol: 'UDP',
+        dest_ip: '127.0.0.1',
+        dest_port: 12345,
         num_connections: 1,
         packets_per_connection: 1000,
         payload_size: 1024,
-        delay_between_packets: 0.0
-      });
+        delay_between_packets: 0.0,
+        delay_between_connections: 0.5
+      }));
     } else if (preset === 'connection_burst') {
-      setSimConfig({
-        ...simConfig,
+      setSimMode('single');
+      setSimConfig((prev) => ({
+        ...prev,
         protocol: 'TCP',
+        dest_ip: '127.0.0.1',
+        dest_port: 12345,
         num_connections: 200,
         packets_per_connection: 1,
         payload_size: 64,
         delay_between_packets: 0.0,
         delay_between_connections: 0.0
-      });
+      }));
+    } else if (preset === 'port_scan') {
+      setSimMode('range');
+      setRangeStart(12340);
+      setRangeEnd(12349);
+      setSimConfig((prev) => ({
+        ...prev,
+        protocol: 'TCP',
+        dest_ip: '127.0.0.1',
+        payload_size: 0,
+        num_connections: 1,
+        packets_per_connection: 1,
+        delay_between_packets: 0.0,
+        delay_between_connections: 0.0
+      }));
     }
   };
 
@@ -263,14 +414,24 @@ const LiveMonitor = () => {
 
   const isRunning = status?.running;
 
-  const stats =
-    status?.stats || null;
+  const stats = status?.stats || null;
+  const hasActiveRun = !!status?.run_id;
 
-  const hasActiveRun =
-    !!status?.run_id;
+  // Use dedicated simStats (from run_id polling) when available;
+  // fall back to general status stats for live monitoring display.
+  const activeSimStats = simStats || stats;
+
+  const displayStats =
+    activeSimStats || {
+      total_packets: 0,
+      flushed_flows: 0,
+      predictions: 0,
+      alerts: 0,
+      inference_errors: 0
+    };
 
   const simState =
-    stats?.simulation_state ||
+    (simRunId ? simStats?.simulation_state : stats?.simulation_state) ||
     'IDLE';
 
   const isSimActive =
@@ -280,49 +441,29 @@ const LiveMonitor = () => {
       simState === 'PROCESSING'
     );
 
+  const targetPortsCount =
+    isNaN(rangeStart) || isNaN(rangeEnd) ? 0 : Math.max(0, rangeEnd - rangeStart + 1);
+
   let displayMessage = '';
 
-  if (
-    isSimActive &&
-    simState === 'RUNNING'
-  ) {
-    displayMessage =
-      'Generating controlled traffic...';
-  } else if (
-    isSimActive &&
-    simState === 'PROCESSING'
-  ) {
-    displayMessage =
-      'Finishing flow aggregation and model inference...';
-  } else if (
-    isRunning &&
-    simState === 'COMPLETED'
-  ) {
-    displayMessage =
-      'Simulation completed successfully.';
-  } else if (
-    isRunning &&
-    (
-      !hasActiveRun ||
-      simState === 'IDLE'
-    )
-  ) {
-    displayMessage =
-      'Ready to start a traffic simulation.';
+  if (validationError) {
+    displayMessage = validationError;
   } else if (apiError) {
     displayMessage = apiError;
+  } else if (isSubmitting) {
+    displayMessage = 'Starting simulation request...';
+  } else if (isSimActive && simState === 'RUNNING') {
+    displayMessage = 'Generating controlled traffic...';
+  } else if (isSimActive && simState === 'PROCESSING') {
+    displayMessage = 'Finishing flow aggregation and model inference...';
+  } else if (isRunning && simState === 'COMPLETED') {
+    displayMessage = 'Simulation completed successfully.';
+  } else if (isRunning && (!hasActiveRun || simState === 'IDLE')) {
+    displayMessage = 'Ready to start a traffic simulation.';
   }
 
-  const displayStats =
-    stats || {
-      total_packets: 0,
-      flushed_flows: 0,
-      predictions: 0,
-      alerts: 0,
-      inference_errors: 0
-    };
-
   const showSimStats =
+    !!simRunId ||
     hasActiveRun ||
     (
       isRunning &&
@@ -376,11 +517,10 @@ const LiveMonitor = () => {
 
                 <select
                   value={interfaceName}
-                  onChange={(e) =>
-                    setInterfaceName(
-                      e.target.value
-                    )
-                  }
+                  onChange={(e) => {
+                    setInterfaceName(e.target.value);
+                    localStorage.setItem('sentinel_selected_interface', e.target.value);
+                  }}
                   disabled={
                     isRunning ||
                     actionLoading ||
@@ -588,41 +728,134 @@ const LiveMonitor = () => {
 
 
         {/* Presets */}
-        <div className="flex flex-wrap gap-2 mb-6">
+        <div className="flex flex-wrap items-center gap-2 mb-6">
 
           <span className="text-xs font-bold text-[#6EA2B3] uppercase tracking-wider self-center mr-2">
             Presets:
           </span>
 
           <button
+            type="button"
             onClick={() =>
               applyPreset('normal')
             }
-            className="glass-button px-3 py-1.5 text-xs font-bold"
+            className={`glass-button px-3 py-1.5 text-xs font-bold transition-all ${
+              simMode === 'single' && simConfig.protocol === 'UDP' && simConfig.num_connections === 3
+                ? 'border-[#7BBDE8]/60 bg-[#0A4174]/60 text-white'
+                : ''
+            }`}
           >
             Normal
           </button>
 
           <button
+            type="button"
             onClick={() =>
               applyPreset('high_rate')
             }
-            className="glass-button px-3 py-1.5 text-xs font-bold"
+            className={`glass-button px-3 py-1.5 text-xs font-bold transition-all ${
+              simMode === 'single' && simConfig.protocol === 'UDP' && simConfig.packets_per_connection === 1000
+                ? 'border-[#7BBDE8]/60 bg-[#0A4174]/60 text-white'
+                : ''
+            }`}
           >
             High Rate (UDP)
           </button>
 
           <button
+            type="button"
             onClick={() =>
               applyPreset('connection_burst')
             }
-            className="glass-button px-3 py-1.5 text-xs font-bold"
+            className={`glass-button px-3 py-1.5 text-xs font-bold transition-all ${
+              simMode === 'single' && simConfig.protocol === 'TCP' && simConfig.num_connections === 200
+                ? 'border-[#7BBDE8]/60 bg-[#0A4174]/60 text-white'
+                : ''
+            }`}
           >
             Connection Burst (TCP)
           </button>
 
+          <button
+            type="button"
+            onClick={() =>
+              applyPreset('port_scan')
+            }
+            className={`glass-button px-3 py-1.5 text-xs font-bold transition-all ${
+              simMode === 'range' && simConfig.protocol === 'TCP' && rangeStart === 12340 && rangeEnd === 12349
+                ? 'border-rose-400 bg-rose-500/20 text-rose-200 shadow-[0_0_12px_rgba(244,63,94,0.3)]'
+                : 'border-rose-500/40 text-rose-300 hover:border-rose-400 hover:text-white'
+            }`}
+          >
+            Port Scan (TCP SYN)
+          </button>
+
         </div>
 
+        {/* Mode Selector */}
+        <div className="flex flex-wrap items-center justify-between gap-4 mb-6 pb-4 border-b border-[#49769F]/20">
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-bold text-[#6EA2B3] uppercase tracking-wider">
+              Simulation Mode:
+            </span>
+            <div className="inline-flex rounded-lg bg-[#001D39]/80 p-1 border border-[#49769F]/30">
+              <button
+                type="button"
+                onClick={() => {
+                  setSimMode('single');
+                  setValidationError(null);
+                }}
+                className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                  simMode === 'single'
+                    ? 'bg-[#0A4174] text-white shadow-[0_0_10px_rgba(123,189,232,0.3)] border border-[#7BBDE8]/40'
+                    : 'text-[#6EA2B3] hover:text-white'
+                }`}
+              >
+                Single Port
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSimMode('range');
+                  setValidationError(null);
+                }}
+                className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                  simMode === 'range'
+                    ? 'bg-[#0A4174] text-white shadow-[0_0_10px_rgba(123,189,232,0.3)] border border-[#7BBDE8]/40'
+                    : 'text-[#6EA2B3] hover:text-white'
+                }`}
+              >
+                Port Range Scan
+              </button>
+            </div>
+          </div>
+
+          {simMode === 'range' && (
+            <div className="flex items-center gap-2 px-3 py-1.5 bg-[#001D39]/60 border border-[#7BBDE8]/30 rounded-lg">
+              <span className="text-xs font-bold text-[#6EA2B3] uppercase tracking-wider">
+                Number of Target Ports:
+              </span>
+              <span
+                className={`text-xs font-mono font-bold px-2 py-0.5 rounded ${
+                  targetPortsCount > 11 || targetPortsCount < 1
+                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                    : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                }`}
+              >
+                {targetPortsCount} {targetPortsCount === 1 ? 'port' : 'ports'}
+                {targetPortsCount > 11 && ' (Backend limit is 11)'}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* Validation Error Alert */}
+        {validationError && (
+          <div className="mb-6 bg-rose-500/10 border border-rose-500/40 rounded-xl p-3.5 flex items-center gap-3 text-rose-300 text-xs animate-in fade-in">
+            <AlertTriangle size={16} className="text-rose-400 flex-shrink-0" />
+            <span className="font-medium">{validationError}</span>
+          </div>
+        )}
 
         {/* Simulator Configuration */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
@@ -679,30 +912,89 @@ const LiveMonitor = () => {
 
           </div>
 
+          {/* Port input(s) based on mode */}
+          {simMode === 'single' ? (
+            <div>
 
-          <div>
+              <label className="block text-xs font-bold text-[#6EA2B3] uppercase tracking-wider mb-1">
+                Dest Port
+              </label>
 
-            <label className="block text-xs font-bold text-[#6EA2B3] uppercase tracking-wider mb-1">
-              Dest Port
-            </label>
+              <input
+                type="number"
+                value={simConfig.dest_port}
+                onChange={(e) =>
+                  setSimConfig({
+                    ...simConfig,
+                    dest_port:
+                      parseInt(
+                        e.target.value
+                      ) || 0
+                  })
+                }
+                className="w-full bg-[#001D39]/60 border border-[#49769F]/40 rounded-lg px-3 py-2 text-white"
+              />
 
-            <input
-              type="number"
-              value={simConfig.dest_port}
-              onChange={(e) =>
-                setSimConfig({
-                  ...simConfig,
-                  dest_port:
-                    parseInt(
-                      e.target.value
-                    )
-                })
-              }
-              className="w-full bg-[#001D39]/60 border border-[#49769F]/40 rounded-lg px-3 py-2 text-white"
-            />
+            </div>
+          ) : (
+            <>
+              <div>
 
-          </div>
+                <label className="block text-xs font-bold text-[#6EA2B3] uppercase tracking-wider mb-1">
+                  Start Port
+                </label>
 
+                <input
+                  type="number"
+                  value={rangeStart}
+                  onChange={(e) =>
+                    setRangeStart(parseInt(e.target.value) || 0)
+                  }
+                  className="w-full bg-[#001D39]/60 border border-[#49769F]/40 rounded-lg px-3 py-2 text-white"
+                />
+
+              </div>
+
+              <div>
+
+                <div className="flex justify-between items-center mb-1">
+                  <label className="block text-xs font-bold text-[#6EA2B3] uppercase tracking-wider">
+                    End Port
+                  </label>
+                  <span className="text-[10px] text-[#7BBDE8] font-mono">
+                    {targetPortsCount} ports
+                  </span>
+                </div>
+
+                <input
+                  type="number"
+                  value={rangeEnd}
+                  onChange={(e) =>
+                    setRangeEnd(parseInt(e.target.value) || 0)
+                  }
+                  className="w-full bg-[#001D39]/60 border border-[#49769F]/40 rounded-lg px-3 py-2 text-white"
+                />
+
+              </div>
+
+              <div>
+
+                <label className="block text-xs font-bold text-[#6EA2B3] uppercase tracking-wider mb-1">
+                  Number of Target Ports
+                </label>
+
+                <div className="w-full bg-[#001D39]/40 border border-[#49769F]/40 rounded-lg px-3 py-2 text-white flex items-center justify-between">
+                  <span className="font-mono font-bold text-[#7BBDE8]">
+                    {targetPortsCount} {targetPortsCount === 1 ? 'Port' : 'Ports'}
+                  </span>
+                  <span className="text-[10px] text-[#6EA2B3] uppercase">
+                    {targetPortsCount > 11 ? 'Exceeds limit' : 'Calculated'}
+                  </span>
+                </div>
+
+              </div>
+            </>
+          )}
 
           <div>
 
@@ -845,9 +1137,10 @@ const LiveMonitor = () => {
             onClick={handleSimulate}
             disabled={
               !isRunning ||
-              isSimActive
+              isSimActive ||
+              isSubmitting
             }
-            className="w-full md:w-auto bg-[#0A4174]/80 hover:bg-[#49769F]/80 text-white font-bold py-3 px-8 rounded-xl flex items-center justify-center gap-2 transition-all disabled:opacity-50 border border-[#7BBDE8]/30 shadow-[0_0_15px_rgba(123,189,232,0.15)]"
+            className="w-full md:w-auto bg-[#0A4174]/80 hover:bg-[#49769F]/80 text-white font-bold py-3 px-8 rounded-xl flex items-center justify-center gap-2 transition-all disabled:opacity-50 border border-[#7BBDE8]/30 shadow-[0_0_15px_rgba(123,189,232,0.15)] cursor-pointer disabled:cursor-not-allowed"
           >
 
             <Play
@@ -857,7 +1150,7 @@ const LiveMonitor = () => {
             />
 
             <span>
-              RUN SIMULATION
+              {isSubmitting ? 'STARTING...' : 'RUN SIMULATION'}
             </span>
 
           </button>
@@ -874,17 +1167,23 @@ const LiveMonitor = () => {
               <span
                 className={`text-sm font-bold ${isSimActive
                     ? 'text-emerald-400 animate-pulse'
-                    : apiError
-                      ? 'text-red-400'
-                      : 'text-white'
+                    : isSubmitting
+                      ? 'text-[#7BBDE8] animate-pulse'
+                      : validationError || apiError
+                        ? 'text-rose-400'
+                        : 'text-white'
                   }`}
               >
                 {
-                  apiError
-                    ? 'ERROR'
-                    : isRunning
-                      ? simState
-                      : 'IDLE'
+                  validationError
+                    ? 'VALIDATION ERROR'
+                    : apiError
+                      ? 'ERROR'
+                      : isSubmitting
+                        ? 'STARTING'
+                        : isRunning
+                          ? simState
+                          : 'IDLE'
                 }
               </span>
 
@@ -899,7 +1198,7 @@ const LiveMonitor = () => {
 
             ) : displayMessage ? (
 
-              <p className="text-xs text-[#BDD8E9] mt-1">
+              <p className={`text-xs mt-1 ${validationError ? 'text-rose-300 font-medium' : 'text-[#BDD8E9]'}`}>
                 {displayMessage}
               </p>
 
@@ -925,15 +1224,15 @@ const LiveMonitor = () => {
                 />
 
                 {(() => {
-                  if (!isRunning && simState === 'COMPLETED') {
-                    return 'LAST COMPLETED SIMULATION';
-                  }
-                  
-                  // Check if this is a simulation run (run_id starts with SIM-)
-                  const isSimulationRun = status?.run_id?.startsWith('SIM-');
+                  const currentRun = simRunId || status?.run_id;
+                  const isSimulationRun = currentRun?.startsWith('SIM-');
                   
                   if (isSimulationRun) {
-                    return 'CURRENT SIMULATION';
+                    return simState === 'COMPLETED' ? 'LAST COMPLETED SIMULATION' : 'CURRENT SIMULATION';
+                  }
+
+                  if (!isRunning && simState === 'COMPLETED') {
+                    return 'LAST COMPLETED SIMULATION';
                   }
                   
                   // Real capture - get the interface label
@@ -952,11 +1251,11 @@ const LiveMonitor = () => {
               </h3>
 
 
-              {status?.run_id && (
+              {(simRunId || status?.run_id) && (
 
                 <div className="bg-[#0A4174]/40 border border-[#7BBDE8]/30 px-3 py-1 rounded text-xs font-mono text-[#7BBDE8]">
 
-                  Run ID: {status.run_id}
+                  Run ID: {simRunId || status.run_id}
 
                 </div>
 

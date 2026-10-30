@@ -180,6 +180,7 @@ class LiveInferenceService:
             return False
             
         key = (src_ip, dst_ip)
+        run_id = prediction_result.get("run_id")
         now = time.time()
         
         alert_created = False
@@ -187,8 +188,13 @@ class LiveInferenceService:
             if len(self.correlation_state) > 1000:
                 keys_to_delete = []
                 for k, v in self.correlation_state.items():
-                    v["observations"] = [obs for obs in v["observations"] if now - obs["timestamp"] <= self.WINDOW_SECONDS]
-                    if not v["observations"]:
+                    v["observations"] = [obs for obs in v.get("observations", []) if now - obs["timestamp"] <= self.WINDOW_SECONDS]
+                    if "run_states" in v:
+                        for r_k, r_v in list(v["run_states"].items()):
+                            r_v["observations"] = [obs for obs in r_v.get("observations", []) if now - obs["timestamp"] <= self.WINDOW_SECONDS]
+                            if not r_v["observations"]:
+                                del v["run_states"][r_k]
+                    if not v["observations"] and not v.get("run_states"):
                         keys_to_delete.append(k)
                 for k in keys_to_delete:
                     del self.correlation_state[k]
@@ -196,37 +202,95 @@ class LiveInferenceService:
             if key not in self.correlation_state:
                 self.correlation_state[key] = {
                     "observations": [],
-                    "alerted": False
+                    "alerted": False,
+                    "run_states": {}
                 }
             
             state = self.correlation_state[key]
-            state["observations"] = [obs for obs in state["observations"] if now - obs["timestamp"] <= self.WINDOW_SECONDS]
-            
-            state["observations"].append({
+            if "run_states" not in state:
+                state["run_states"] = {}
+            if "observations" not in state:
+                state["observations"] = []
+            if "alerted" not in state:
+                state["alerted"] = False
+
+            # Scope by run_id if provided (simulation run boundary), otherwise use global host-pair state
+            if run_id:
+                if run_id not in state["run_states"]:
+                    state["run_states"][run_id] = {
+                        "observations": [],
+                        "alerted": False
+                    }
+                active_target = state["run_states"][run_id]
+            else:
+                active_target = state
+
+            # Prune observations older than WINDOW_SECONDS
+            active_target["observations"] = [
+                obs for obs in active_target.get("observations", [])
+                if now - obs["timestamp"] <= self.WINDOW_SECONDS
+            ]
+
+            # If all observations in the sliding window have expired, reset alerted flag for this target
+            if not active_target["observations"]:
+                active_target["alerted"] = False
+
+            active_target["observations"].append({
                 "timestamp": now,
                 "dst_port": dst_port,
                 "prediction_id": prediction_id
             })
             
-            unique_ports = len(set(obs["dst_port"] for obs in state["observations"]))
+            unique_ports = len(set(obs["dst_port"] for obs in active_target["observations"]))
             
             if unique_ports >= self.MIN_DISTINCT_PORTS:
-                if not state["alerted"]:
-                    state["alerted"] = True
-                    print(f"!!! TRIGGERING ALERT FOR {src_ip} -> {dst_ip} with {unique_ports} ports !!!")
-                    logger_service.logger.warning(f"PortScan confirmed: source={src_ip} target={dst_ip} unique_ports={unique_ports} window={self.WINDOW_SECONDS}s")
-                    db_service.save_alert(prediction_id, severity="high")
-                    alert_created = True
+                if not active_target["alerted"]:
+                    if not prediction_id:
+                        logger_service.logger.error(
+                            f"[CORRELATION][{run_id}] Cannot save alert for {src_ip} -> {dst_ip}: prediction_id is None (persistence failed)."
+                        )
+                    else:
+                        print(f"!!! TRIGGERING ALERT FOR {src_ip} -> {dst_ip} with {unique_ports} ports (run_id={run_id}) !!!")
+                        logger_service.logger.warning(
+                            f"[CORRELATION][{run_id}] PortScan confirmed: source={src_ip} target={dst_ip} unique_ports={unique_ports}/{self.MIN_DISTINCT_PORTS} window={self.WINDOW_SECONDS}s"
+                        )
+                        saved_alert_id = db_service.save_alert(prediction_id, severity="high")
+                        if saved_alert_id:
+                            active_target["alerted"] = True
+                            alert_created = True
+                            logger_service.logger.info(
+                                f"[CORRELATION][{run_id}] Alert successfully saved with alert_id={saved_alert_id} for prediction_id={prediction_id}"
+                            )
+                        else:
+                            logger_service.logger.error(
+                                f"[CORRELATION][{run_id}] Failed to persist alert for {src_ip} -> {dst_ip} (prediction_id={prediction_id}). Will allow retry on later flow."
+                            )
+                else:
+                    logger_service.logger.info(
+                        f"[CORRELATION][{run_id}] PortScan threshold satisfied ({unique_ports}/{self.MIN_DISTINCT_PORTS} ports) but duplicate alert suppressed (run already alerted)"
+                    )
             else:
-                logger_service.logger.info(f"ML PortScan candidate: source={src_ip} destination_port={dst_port} unique_ports={unique_ports}/{self.MIN_DISTINCT_PORTS}")
-                
-            if not state["observations"]:
-                del self.correlation_state[key]
+                logger_service.logger.info(
+                    f"[CORRELATION][{run_id}] ML PortScan candidate: source={src_ip} destination_port={dst_port} unique_ports={unique_ports}/{self.MIN_DISTINCT_PORTS}"
+                )
+
+            # Sync top-level state
+            if not run_id:
+                state["alerted"] = active_target["alerted"]
+                state["observations"] = active_target["observations"]
+            else:
+                state["last_run_id"] = run_id
+                state["last_run_alerted"] = active_target["alerted"]
 
         return alert_created
                 
-    def clear_correlation_state(self):
+    def clear_correlation_state(self, run_id: str = None):
         with self.correlation_lock:
-            self.correlation_state.clear()
+            if run_id:
+                for state in self.correlation_state.values():
+                    if "run_states" in state and run_id in state["run_states"]:
+                        del state["run_states"][run_id]
+            else:
+                self.correlation_state.clear()
 
 live_inference_service = LiveInferenceService()
